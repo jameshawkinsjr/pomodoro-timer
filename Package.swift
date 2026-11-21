@@ -5,6 +5,9 @@ let package = Package(
     name: "PomodoroTimer",
     platforms: [.macOS(.v13)],
     targets: [
-        .executableTarget(name: "PomodoroTimer", path: "Sources/PomodoroTimer")
+        // Finding and verifying updates, without AppKit, so `swift test` can cover it.
+        .target(name: "PomodoroTimerCore", path: "Sources/PomodoroTimerCore"),
+        .executableTarget(name: "PomodoroTimer", dependencies: ["PomodoroTimerCore"], path: "Sources/PomodoroTimer"),
+        .testTarget(name: "PomodoroTimerCoreTests", dependencies: ["PomodoroTimerCore"], path: "Tests/PomodoroTimerCoreTests"),
     ]
 )
