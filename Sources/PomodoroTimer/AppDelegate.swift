@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let presets: [Int] = [5, 10, 15, 30, 60, 120, 180, 240, 360, 480]
 
     private let assertion = SleepAssertion()
+    private let updater = Updater()
     private let defaults = UserDefaults.standard
     private let activeIcon = TomatoIcon.menuBarImage(active: true)
     private let inactiveIcon = TomatoIcon.menuBarImage(active: false)
@@ -32,6 +33,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var batteryRuleItem: NSMenuItem!
     private var wifiRuleItem: NSMenuItem!
     private var soundMenu: NSMenu!
+    private var updateStatusItem: NSMenuItem!
+    private var installUpdateItem: NSMenuItem!
+    private var checkUpdatesItem: NSMenuItem!
+    private var autoUpdateItem: NSMenuItem!
     /// Held so a playing sound isn't deallocated mid-playback.
     private var currentSound: NSSound?
 
@@ -113,6 +118,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         poll.tolerance = 5
         RunLoop.main.add(poll, forMode: .common)
         reevaluateRules()
+
+        updater.onChange = { [weak self] in self?.updateUI() }
+        updater.start()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -206,6 +214,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         launchAtLoginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         launchAtLoginItem.target = self
         menu.addItem(launchAtLoginItem)
+
+        menu.addItem(.separator())
+        menu.addItem(sectionHeader("Updates"))
+
+        updateStatusItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        updateStatusItem.isEnabled = false
+        menu.addItem(updateStatusItem)
+
+        installUpdateItem = NSMenuItem(title: "Install and Restart", action: #selector(installUpdate), keyEquivalent: "")
+        installUpdateItem.target = self
+        menu.addItem(installUpdateItem)
+
+        checkUpdatesItem = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
+        checkUpdatesItem.target = self
+        menu.addItem(checkUpdatesItem)
+
+        autoUpdateItem = NSMenuItem(title: "Update Automatically", action: #selector(toggleAutoUpdate), keyEquivalent: "")
+        autoUpdateItem.target = self
+        autoUpdateItem.toolTip = "Installs a new build by itself once you're not using the Mac."
+        menu.addItem(autoUpdateItem)
 
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit Pomodoro Timer", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -312,6 +340,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateUI()
     }
 
+    @objc private func checkForUpdates() {
+        updater.check()
+    }
+
+    @objc private func installUpdate() {
+        updater.install()
+    }
+
+    @objc private func toggleAutoUpdate() {
+        updater.autoUpdate.toggle()
+        if updater.autoUpdate { updater.check() }
+        updateUI()
+    }
+
     // MARK: - Session
 
     private func startSession(duration: TimeInterval?) {
@@ -412,6 +454,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         launchAtLoginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
         for item in soundMenu.items where !item.isSeparatorItem {
             item.state = (item.representedObject as? String) == completionSound ? .on : .off
+        }
+
+        let (updateText, updateDetail) = updateStatus()
+        updateStatusItem.title = updateText
+        updateStatusItem.toolTip = updateDetail
+        installUpdateItem.isHidden = updater.readyRelease == nil
+        installUpdateItem.title = updater.readyRelease.map { "Install \($0.version) and Restart" } ?? "Install and Restart"
+        checkUpdatesItem.isEnabled = updater.app != nil && !updater.isBusy
+        autoUpdateItem.isEnabled = updater.app != nil
+        autoUpdateItem.state = updater.autoUpdate ? .on : .off
+    }
+
+    /// The Updates section's status line, and the longer text shown when hovering over it.
+    private func updateStatus() -> (String, String?) {
+        guard let app = updater.app else { return ("Updates off (development build)", "Only a built Pomodoro Timer.app updates itself.") }
+        // Set when the last install was rolled back; cleared by the next Install and Restart.
+        if let notice = updater.notice { return ("Last update failed; kept \(app.version)", notice) }
+        switch updater.status {
+        case .notChecked: return ("Version \(app.label)", nil)
+        case .checking: return ("Checking for updates…", nil)
+        case .upToDate: return ("Up to date (\(app.version))", "Build \(app.build)")
+        case .downloading(let release): return ("Downloading \(release.label)…", nil)
+        case .ready(let release): return ("\(release.label) is ready", release.notes)
+        case .installing(let release): return ("Installing \(release.label)…", nil)
+        case .failed(let message): return ("Couldn't update", message)
         }
     }
 
