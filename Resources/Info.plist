@@ -24,5 +24,9 @@
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSLocationUsageDescription</key>
+    <string>Pomodoro Timer uses Location permission only to read the Wi-Fi network name for the "Keep Awake on Wi-Fi" rule.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>Pomodoro Timer uses Location permission only to read the Wi-Fi network name for the "Keep Awake on Wi-Fi" rule.</string>
 </dict>
 </plist>

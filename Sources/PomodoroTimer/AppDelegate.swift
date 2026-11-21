@@ -1,4 +1,7 @@
 import AppKit
+import CoreLocation
+import IOKit.ps
+import notify
 import ServiceManagement
 
 @MainActor
@@ -7,6 +10,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         static let keepDisplayAwake = "keepDisplayAwake"
         static let showCountdown = "showCountdown"
         static let completionSound = "completionSound"
+        static let keepAwakeOnBattery = "keepAwakeOnBattery"
+        static let keepAwakeOnWiFi = "keepAwakeOnWiFi"
+        static let keepAwakeSSID = "keepAwakeSSID"
     }
 
     /// Preset durations offered in the menu, in minutes.
@@ -24,6 +30,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var keepDisplayItem: NSMenuItem!
     private var showCountdownItem: NSMenuItem!
     private var launchAtLoginItem: NSMenuItem!
+    private var batteryRuleItem: NSMenuItem!
+    private var wifiRuleItem: NSMenuItem!
     private var soundMenu: NSMenu!
     private var updateStatusItem: NSMenuItem!
     private var installUpdateItem: NSMenuItem!
@@ -37,6 +45,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var endDate: Date?
     private var ticker: Timer?
 
+    /// Why a rule holds the Mac awake outside a session (e.g. "on battery"); nil when no rule applies.
+    private var autoHoldReason: String?
+    private var powerSourceToken: Int32 = 0
+    /// Created on first use, so the Location prompt only appears when the Wi-Fi rule is set up.
+    private var locationManager: CLLocationManager?
+    private var savePendingNetwork = false
+
     private var keepDisplayAwake: Bool {
         get { defaults.bool(forKey: DefaultsKey.keepDisplayAwake) }
         set { defaults.set(newValue, forKey: DefaultsKey.keepDisplayAwake) }
@@ -45,6 +60,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var showCountdown: Bool {
         get { defaults.bool(forKey: DefaultsKey.showCountdown) }
         set { defaults.set(newValue, forKey: DefaultsKey.showCountdown) }
+    }
+
+    private var keepAwakeOnBattery: Bool {
+        get { defaults.bool(forKey: DefaultsKey.keepAwakeOnBattery) }
+        set { defaults.set(newValue, forKey: DefaultsKey.keepAwakeOnBattery) }
+    }
+
+    private var keepAwakeOnWiFi: Bool {
+        get { defaults.bool(forKey: DefaultsKey.keepAwakeOnWiFi) }
+        set { defaults.set(newValue, forKey: DefaultsKey.keepAwakeOnWiFi) }
+    }
+
+    /// SSID saved by "Use Current Network"; empty means none saved.
+    private var keepAwakeSSID: String {
+        get { defaults.string(forKey: DefaultsKey.keepAwakeSSID) ?? "" }
+        set { defaults.set(newValue, forKey: DefaultsKey.keepAwakeSSID) }
     }
 
     /// Name of the system sound played when a timed session finishes; empty means no sound.
@@ -68,12 +99,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DefaultsKey.keepDisplayAwake: true,
             DefaultsKey.showCountdown: true,
             DefaultsKey.completionSound: "Glass",
+            DefaultsKey.keepAwakeOnBattery: false,
+            DefaultsKey.keepAwakeOnWiFi: false,
+            DefaultsKey.keepAwakeSSID: "",
         ])
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.imagePosition = .imageLeading
         statusItem.menu = buildMenu()
-        updateUI()
+
+        notify_register_dispatch(kIOPSNotifyPowerSource, &powerSourceToken, .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.reevaluateRules() }
+        }
+        // shortcut: polls the SSID every 30 s instead of CoreWLAN events; switch to CWEventDelegate if 30 s lag matters.
+        let poll = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.reevaluateRules() }
+        }
+        poll.tolerance = 5
+        RunLoop.main.add(poll, forMode: .common)
+        reevaluateRules()
 
         updater.onChange = { [weak self] in self?.updateUI() }
         updater.start()
@@ -153,6 +197,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         soundItem.submenu = soundMenu
         menu.addItem(soundItem)
 
+        batteryRuleItem = NSMenuItem(title: "Keep Awake on Battery", action: #selector(toggleBatteryRule), keyEquivalent: "")
+        batteryRuleItem.target = self
+        batteryRuleItem.toolTip = "Holds the Mac awake whenever it runs on battery, even with no session."
+        menu.addItem(batteryRuleItem)
+
+        wifiRuleItem = NSMenuItem(title: "Keep Awake on Wi-Fi", action: #selector(toggleWiFiRule), keyEquivalent: "")
+        wifiRuleItem.target = self
+        wifiRuleItem.toolTip = "Holds the Mac awake whenever it is joined to the saved network, even with no session."
+        menu.addItem(wifiRuleItem)
+
+        let useNetwork = NSMenuItem(title: "Use Current Network as Wi-Fi Rule", action: #selector(useCurrentNetwork), keyEquivalent: "")
+        useNetwork.target = self
+        menu.addItem(useNetwork)
+
         launchAtLoginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         launchAtLoginItem.target = self
         menu.addItem(launchAtLoginItem)
@@ -218,10 +276,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleKeepDisplay() {
         keepDisplayAwake.toggle()
-        if isActive {
+        if assertion.isHeld {
             assertion.acquire(keepDisplayAwake: keepDisplayAwake)
         }
         updateUI()
+    }
+
+    @objc private func toggleBatteryRule() {
+        keepAwakeOnBattery.toggle()
+        reevaluateRules()
+    }
+
+    @objc private func toggleWiFiRule() {
+        keepAwakeOnWiFi.toggle()
+        reevaluateRules()
+    }
+
+    @objc private func useCurrentNetwork() {
+        if let ssid = AwakeRules.currentSSID {
+            keepAwakeSSID = ssid
+            keepAwakeOnWiFi = true
+            reevaluateRules()
+            return
+        }
+        let manager = locationManager ?? CLLocationManager()
+        if manager.authorizationStatus == .notDetermined {
+            // macOS only reveals the SSID to apps with Location permission; retry once the user answers.
+            savePendingNetwork = true
+            locationManager = manager
+            manager.delegate = self
+            NSApp.activate(ignoringOtherApps: true)
+            manager.requestWhenInUseAuthorization()
+            return
+        }
+        let detail = ![.denied, .restricted].contains(manager.authorizationStatus)
+            ? "Make sure Wi-Fi is on and joined to a network, then try again."
+            : "macOS only shows the Wi-Fi network name to apps with Location permission. Turn on Pomodoro Timer in System Settings > Privacy & Security > Location Services, then try again."
+        showError("Couldn't read the current Wi-Fi network.", detail: detail)
     }
 
     @objc private func toggleShowCountdown() {
@@ -290,6 +381,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         assertion.release()
         isActive = false
         endDate = nil
+        reevaluateRules()  // a rule may keep the Mac awake after the session
+    }
+
+    /// Holds or releases the assertion for the battery / Wi-Fi rules. A manual session owns the assertion while active.
+    private func reevaluateRules() {
+        autoHoldReason = AwakeRules.holdReason(
+            onBattery: AwakeRules.onBattery,
+            ssid: keepAwakeOnWiFi ? AwakeRules.currentSSID : nil,
+            batteryRule: keepAwakeOnBattery,
+            wifiRule: keepAwakeOnWiFi,
+            savedSSID: keepAwakeSSID
+        )
+        if !isActive {
+            if autoHoldReason == nil {
+                assertion.release()
+            } else if !assertion.isHeld {
+                assertion.acquire(keepDisplayAwake: keepDisplayAwake)
+            }
+        }
         updateUI()
     }
 
@@ -307,7 +417,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func updateUI() {
         guard let button = statusItem?.button else { return }
 
-        button.image = isActive ? activeIcon : inactiveIcon
+        button.image = assertion.isHeld ? activeIcon : inactiveIcon
 
         let remaining = endDate.map { max(0, $0.timeIntervalSinceNow) }
         if let remaining, showCountdown {
@@ -319,7 +429,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             button.attributedTitle = NSAttributedString(string: "")
         }
 
-        if !isActive {
+        if !isActive, assertion.isHeld, let autoHoldReason {
+            statusMenuItem.title = "Awake — \(autoHoldReason)"
+            button.toolTip = "Pomodoro Timer: awake \(autoHoldReason)"
+        } else if !isActive {
             statusMenuItem.title = "Session inactive"
             button.toolTip = "Pomodoro Timer: inactive"
         } else if let remaining, let endDate {
@@ -334,6 +447,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         endSessionItem.isEnabled = isActive
         keepDisplayItem.state = keepDisplayAwake ? .on : .off
         showCountdownItem.state = showCountdown ? .on : .off
+        batteryRuleItem.state = keepAwakeOnBattery ? .on : .off
+        wifiRuleItem.title = keepAwakeSSID.isEmpty ? "Keep Awake on Wi-Fi" : "Keep Awake on Wi-Fi “\(keepAwakeSSID)”"
+        wifiRuleItem.isEnabled = !keepAwakeSSID.isEmpty
+        wifiRuleItem.state = keepAwakeOnWiFi && !keepAwakeSSID.isEmpty ? .on : .off
         launchAtLoginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
         for item in soundMenu.items where !item.isSeparatorItem {
             item.state = (item.representedObject as? String) == completionSound ? .on : .off
@@ -431,5 +548,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if minutes < 60 { return "\(minutes) minutes" }
         let hours = minutes / 60
         return hours == 1 ? "1 hour" : "\(hours) hours"
+    }
+}
+
+extension AppDelegate: @preconcurrency CLLocationManagerDelegate {
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        guard savePendingNetwork, manager.authorizationStatus != .notDetermined else { return }
+        savePendingNetwork = false
+        useCurrentNetwork()
     }
 }
