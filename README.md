@@ -2,7 +2,7 @@
 
 A small macOS menu bar timer with a tomato icon. Pick a length from the menu (5 minutes to 8 hours) and it counts down in the menu bar, keeps the Mac (and optionally the display) awake while it runs, and plays a sound when it's done. It can start at login.
 
-Two options keep the Mac awake with no session running: **Keep Awake on Battery**, and **Keep Awake on Wi-Fi** for the network saved with **Use Current Network as Wi-Fi Rule**. macOS only shows the Wi-Fi network name to apps with Location permission, so saving a network asks for it the first time.
+**Rules…** keeps the Mac awake with no session running. A rule has conditions that must all be true (power: plugged in or on battery; Wi-Fi: joined to any network or to one named network; hours: a time window on chosen days, which may run past midnight) and an action: keep the Mac awake with the screen allowed to sleep, or keep the screen awake. When several enabled rules match, keeping the screen awake wins. Rules use their own action; **Keep Display Awake** applies to sessions only. macOS only shows the Wi-Fi network name to apps with Location permission, so **Use Current Network** in the rule editor asks for it the first time, and a rule for a named network never matches without it. The old **Keep Awake on Battery** and **Keep Awake on Wi-Fi** settings become rules the first time this version runs.
 
 ## Build
 
@@ -15,7 +15,7 @@ Needs macOS 13 or later and Xcode's command line tools (Swift 6).
 
 The app is ad-hoc signed, so the first time you open a copy from another Mac, right-click it and choose Open.
 
-`swift test` runs the update checker's tests. The version is in `VERSION`; the build number is the git commit count, and `build.sh` stamps both into the app.
+`swift test` runs the tests for the update checker and the keep-awake rules. The version is in `VERSION`; the build number is the git commit count, and `build.sh` stamps both into the app.
 
 ## Updates
 

@@ -6,6 +6,8 @@ import IOKit.pwr_mgt
 final class SleepAssertion {
     private var assertionID: IOPMAssertionID = 0
     private(set) var isHeld = false
+    /// Whether the held assertion keeps the display on, not just the system.
+    private(set) var keepsDisplayAwake = false
 
     /// Acquires the assertion, replacing any existing one. Returns false if macOS refused it.
     @discardableResult
@@ -22,6 +24,7 @@ final class SleepAssertion {
             &assertionID
         )
         isHeld = result == kIOReturnSuccess
+        self.keepsDisplayAwake = keepDisplayAwake
         return isHeld
     }
 
